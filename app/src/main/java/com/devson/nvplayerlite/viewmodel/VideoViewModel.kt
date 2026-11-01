@@ -8,7 +8,6 @@ import com.devson.nvplayerlite.player.PlayerManager
 import com.devson.nvplayerlite.repository.WatchHistoryRepository
 import com.devson.nvplayerlite.repository.DecoderMode
 import androidx.media3.common.Player
-import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -37,8 +36,8 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     private var pendingResumeMs: Long = 0L
 
     // Exposed so that VideoScreen recomposes when the player becomes ready
-    private val _playerInstance = MutableStateFlow<ExoPlayer?>(null)
-    val playerInstance: StateFlow<ExoPlayer?> = _playerInstance.asStateFlow()
+    private val _playerInstance = MutableStateFlow<Player?>(null)
+    val playerInstance: StateFlow<Player?> = _playerInstance.asStateFlow()
 
     // Add this field
     private val _playingIntent = MutableStateFlow(true)
@@ -175,12 +174,15 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
         if (playerManager == null) {
             playerManager = PlayerManager(context)
+            playerManager?.onControllerReady = {
+                _playerInstance.value = playerManager?.player
+                playPendingVideoIfReady()
+            }
             playerManager?.initializePlayer(
                 _currentDecoderMode.value,
                 _defaultAudioLang.value,
                 _defaultSubtitleLang.value
             )
-            _playerInstance.value = playerManager?.exoPlayer
 
             playerManager?.onPlayNext = {
                 playNextVideo()
@@ -204,23 +206,25 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
                 playNextVideo()
             }
 
-            pendingVideo?.let { video ->
-                val resumeMs = pendingResumeMs
-                val playlist = pendingPlaylist
-
-                _currentPlaylist.value = playlist
-                _currentPlaylistIndex.value = playlist.indexOfFirst { it.uri == video.uri }
-
-                playerManager?.playVideo(video)
-                val dur = video.duration
-                val startPos = if (dur > 0 && resumeMs >= dur * 0.95f) 0L else resumeMs
-                if (startPos > 0L) playerManager?.seekTo(startPos)
-                _controlsVisible.value = false
-                pendingVideo = null
-                pendingPlaylist = emptyList()
-                pendingResumeMs = 0L
-            }
+            playPendingVideoIfReady()
         }
+    }
+
+    private fun playPendingVideoIfReady() {
+        val video = pendingVideo ?: return
+        if (playerManager?.player == null) return
+        val resumeMs = pendingResumeMs
+        val playlist = pendingPlaylist
+        _currentPlaylist.value = playlist
+        _currentPlaylistIndex.value = playlist.indexOfFirst { it.uri == video.uri }
+        playerManager?.playVideo(video)
+        val dur = video.duration
+        val startPos = if (dur > 0 && resumeMs >= dur * 0.95f) 0L else resumeMs
+        if (startPos > 0L) playerManager?.seekTo(startPos)
+        _controlsVisible.value = false
+        pendingVideo = null
+        pendingPlaylist = emptyList()
+        pendingResumeMs = 0L
     }
 
     fun toggleDecoderMode() {
@@ -237,30 +241,9 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             settingsRepository?.updateDecoderMode(mode)
             _currentDecoderMode.value = mode
-            val video = _currentVideo.value ?: return@launch
-            val (savedPos, wasPlaying) = playerManager?.releasePlayerAndKeepState() ?: return@launch
-            _playerInstance.value = null
-            playerManager = PlayerManager(getApplication())
-            playerManager?.initializePlayer(
-                mode,
-                _defaultAudioLang.value,
-                _defaultSubtitleLang.value
-            )
-            _playerInstance.value = playerManager?.exoPlayer
-            playerManager?.onPlayNext = { playNextVideo() }
-            playerManager?.onPlayPrevious = { playPreviousVideo() }
-            playerManager?.onVideoEnded = {
-                val uri = _currentVideo.value?.uri
-                val pos = resolvePositionToSave()
-                if (uri != null && pos > 0L) {
-                    viewModelScope.launch { historyRepo.savePosition(uri, pos) }
-                }
-                if (_autoPlayEnabled.value) playNextVideo()
-            }
-            playerManager?.onPlaybackError = { playNextVideo() }
-            playerManager?.playVideo(video)
-            if (savedPos > 0L) playerManager?.seekTo(savedPos)
-            if (!wasPlaying) playerManager?.pause()
+            // The service owns the renderer factory and player lifetime. Runtime
+            // decoder switching will be added through a service command in a later phase.
+            // Persisting the preference here keeps settings stable without disconnecting playback.
         }
     }
 
@@ -275,7 +258,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         _currentPlaylistIndex.value = actualPlaylist.indexOfFirst { it.uri == video.uri }
 
         viewModelScope.launch { historyRepo.recordPlay(video) }
-        if (playerManager != null) {
+        if (playerManager?.player != null) {
             playerManager?.playVideo(video)
             val dur = video.duration
             val startPos = if (dur > 0 && resumePositionMs >= dur * 0.95f) 0L else resumePositionMs
@@ -307,7 +290,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun togglePlayPause() {
-        val willPlay = playerManager?.exoPlayer?.isPlaying == false
+        val willPlay = playerManager?.player?.isPlaying == false
         _playingIntent.value = willPlay
         playerManager?.playPause()
     }
@@ -319,7 +302,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun resolvePositionToSave(): Long {
-        val player = playerManager?.exoPlayer ?: return 0L
+        val player = playerManager?.player ?: return 0L
         val dur = player.duration.coerceAtLeast(0L)
         return if (player.playbackState == Player.STATE_ENDED && dur > 0L) dur
         else player.currentPosition.coerceAtLeast(0L)
@@ -342,8 +325,8 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
         if (uri != null && pos > 0L) {
             viewModelScope.launch { historyRepo.savePosition(uri, pos) }
         }
-        playerManager?.exoPlayer?.stop()
-        playerManager?.exoPlayer?.clearMediaItems()
+        playerManager?.player?.stop()
+        playerManager?.player?.clearMediaItems()
         _currentVideo.value = null
     }
 
@@ -362,14 +345,14 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun beginSeek() {
-        val player = playerManager?.exoPlayer ?: return
+        val player = playerManager?.player ?: return
         _isSeeking.value = true
         _seekPreviewPosition.value = player.currentPosition.coerceAtLeast(0L)
         playerManager?.pause()
     }
 
     fun updateSeekPreview(positionMs: Long) {
-        val duration = playerManager?.exoPlayer?.duration?.coerceAtLeast(0L) ?: 0L
+        val duration = playerManager?.player?.duration?.coerceAtLeast(0L) ?: 0L
         _seekPreviewPosition.value = positionMs.coerceIn(0L, if (duration > 0L) duration else Long.MAX_VALUE)
     }
 
@@ -399,7 +382,7 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun debounceSeekByOffset(offsetMs: Long) {
-        val player = playerManager?.exoPlayer ?: return
+        val player = playerManager?.player ?: return
         
         val startPos = accumulatedSeekTarget ?: player.currentPosition
         val totalDuration = player.duration.coerceAtLeast(0L)
@@ -544,6 +527,6 @@ class VideoViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         super.onCleared()
-        playerManager?.releasePlayer()
+        playerManager?.releasePlayer() // disconnect controller; service keeps playback state
     }
 }

@@ -1,11 +1,11 @@
 package com.devson.nvplayerlite.player
 
-import android.annotation.SuppressLint
+import android.content.ComponentName
 import android.content.Context
+import androidx.core.content.ContextCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
-import androidx.media3.exoplayer.ExoPlayer
 import com.devson.nvplayerlite.model.Video
 import androidx.media3.common.PlaybackException
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -18,14 +18,12 @@ import android.net.Uri
 import androidx.media3.common.util.UnstableApi
 import androidx.annotation.OptIn
 import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.NextRenderersFactory
-import androidx.media3.exoplayer.upstream.Loader
 import android.media.audiofx.LoudnessEnhancer
 import com.devson.nvplayerlite.util.AppLogger
-import androidx.media3.exoplayer.DefaultLoadControl
-import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
-import androidx.media3.common.ForwardingPlayer
-import androidx.media3.session.MediaSession
+import com.google.common.util.concurrent.ListenableFuture
+import androidx.media3.session.MediaController
+import androidx.media3.session.SessionToken
 import com.devson.nvplayerlite.repository.DecoderMode
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.mediacodec.MediaCodecInfo
@@ -81,11 +79,12 @@ class HDRFallbackRenderersFactory(context: Context) : NextRenderersFactory(conte
 @OptIn(UnstableApi::class)
 class PlayerManager(private val context: Context) {
 
-    var exoPlayer: ExoPlayer? = null
+    /** Player proxy backed by PlaybackService. UI never owns the ExoPlayer. */
+    var player: Player? = null
         private set
 
-    var mediaSession: MediaSession? = null
-        private set
+    private var controllerFuture: ListenableFuture<MediaController>? = null
+    var onControllerReady: (() -> Unit)? = null
 
     var onVideoEnded: (() -> Unit)? = null
 
@@ -143,225 +142,96 @@ class PlayerManager(private val context: Context) {
         defaultAudioLang: String = "",
         defaultSubtitleLang: String = ""
     ) {
-        if (exoPlayer == null) {
-            val extensionMode = when (decoderMode) {
-                DecoderMode.HW      -> androidx.media3.exoplayer.DefaultRenderersFactory.EXTENSION_RENDERER_MODE_OFF
-                DecoderMode.HW_PLUS -> androidx.media3.exoplayer.DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON
-                DecoderMode.SW      -> androidx.media3.exoplayer.DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER
-            }
-            val renderersFactory = HDRFallbackRenderersFactory(context)
-                .setExtensionRendererMode(extensionMode)
-                .setEnableDecoderFallback(true)
-                .forceDisableMediaCodecAsynchronousQueueing()
+        if (player != null) {
+            onControllerReady?.invoke()
+            return
+        }
 
-            val loadControl = DefaultLoadControl.Builder()
-                .setBufferDurationsMs(
-                    DefaultLoadControl.DEFAULT_MIN_BUFFER_MS,
-                    DefaultLoadControl.DEFAULT_MAX_BUFFER_MS,
-                    500,
-                    1000
-                )
-                .build()
-
-            val audioAttributes = AudioAttributes.Builder()
-                .setUsage(C.USAGE_MEDIA)
-                .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
-                .build()
-
-            exoPlayer = ExoPlayer.Builder(context)
-                .setRenderersFactory(renderersFactory)
-                .setLoadControl(loadControl)
-                .setAudioAttributes(audioAttributes, true)
-                .setHandleAudioBecomingNoisy(true)
-                .build().apply {
-                    setSeekParameters(androidx.media3.exoplayer.SeekParameters.CLOSEST_SYNC)
-                    addListener(object : Player.Listener {
-                        override fun onIsPlayingChanged(isPlaying: Boolean) {
-                            _isPlaying.value = isPlaying
-                        }
-
-                        override fun onPlaybackStateChanged(playbackState: Int) {
-                            super.onPlaybackStateChanged(playbackState)
-                            if (playbackState == Player.STATE_READY) {
-                                _duration.value = duration.coerceAtLeast(0L)
-                            } else if (playbackState == Player.STATE_ENDED) {
-                                onVideoEnded?.invoke()
-                            }
-                        }
-
-                        override fun onVideoSizeChanged(videoSize: VideoSize) {
-                            if (videoSize.width > 0 && videoSize.height > 0) {
-                                _isPortraitVideo.value = videoSize.height > videoSize.width
-                            }
-                        }
-
-                        override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
-                            super.onTracksChanged(tracks)
-                            // Keep all your existing audio/subtitle track parsing logic here exactly as it is...
-
-                            val newAudioTracks = mutableListOf<TrackInfo>()
-                            val newSubtitleTracks = mutableListOf<TrackInfo>()
-                            var currentAudioIdx = -1
-                            var currentSubIdx = -1
-
-                            val audioGroupCount = tracks.groups.count { it.type == androidx.media3.common.C.TRACK_TYPE_AUDIO }
-                            val subtitleGroupCount = tracks.groups.count { it.type == androidx.media3.common.C.TRACK_TYPE_TEXT }
-
-                            for (group in tracks.groups) {
-                                if (group.type == androidx.media3.common.C.TRACK_TYPE_VIDEO && group.isSelected) {
-                                    val format = group.getTrackFormat(0)
-                                    if (format.frameRate > 0f) {
-                                        _videoFps.value = format.frameRate
-                                    }
-                                } else if (group.type == androidx.media3.common.C.TRACK_TYPE_AUDIO) {
-                                    val format = group.getTrackFormat(0)
-                                    val trackIndex = newAudioTracks.size
-                                    val langName = format.language?.let { java.util.Locale.forLanguageTag(it).displayLanguage }
-                                    val label = if (audioGroupCount == 1) {
-                                        langName ?: "Default"
-                                    } else {
-                                        "Track ${trackIndex + 1}" + (if (langName != null) " - $langName" else "")
-                                    }
-                                    newAudioTracks.add(TrackInfo(trackIndex, label, format.language))
-                                    if (group.isSelected) currentAudioIdx = trackIndex
-                                } else if (group.type == androidx.media3.common.C.TRACK_TYPE_TEXT) {
-                                    val format = group.getTrackFormat(0)
-                                    val trackIndex = newSubtitleTracks.size
-                                    val langName = format.language?.let { java.util.Locale.forLanguageTag(it).displayLanguage }
-                                    val label = if (subtitleGroupCount == 1) {
-                                        langName ?: "Default"
-                                    } else {
-                                        "Track ${trackIndex + 1}" + (if (langName != null) " - $langName" else "")
-                                    }
-                                    newSubtitleTracks.add(TrackInfo(trackIndex, label, format.language))
-                                    if (group.isSelected) currentSubIdx = trackIndex
-                                }
-                            }
-
-                            _audioTracks.value = newAudioTracks
-                            _selectedAudioIndex.value = currentAudioIdx
-
-                            _subtitleTracks.value = newSubtitleTracks
-                            _selectedSubtitleIndex.value = currentSubIdx
-                        }
-
-                        override fun onPlayerError(error: PlaybackException) {
-                            super.onPlayerError(error)
-
-                            AppLogger.log("ExoPlayer error: ${error.message} - $error")
-
-                            val isFormatUnsupported = error.errorCode == PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED
-                            val isDecoderFailed    = error.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED
-
-                            val isSourceError = error.errorCode == PlaybackException.ERROR_CODE_IO_UNSPECIFIED ||
-                                    error.cause?.cause is IllegalStateException ||
-                                    error.cause is Loader.UnexpectedLoaderException
-
-                            val isMediaCodecRendererError = error.message?.contains("MediaCodecVideoRenderer") == true ||
-                                    error.errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED
-
-                            when {
-                                isMediaCodecRendererError -> {
-                                    AppLogger.log("Recovering from MediaCodecVideoRenderer crash...")
-                                    val lastPos = exoPlayer?.currentPosition ?: 0L
-                                    exoPlayer?.prepare()
-                                    exoPlayer?.seekTo(lastPos)
-                                }
-                                isFormatUnsupported || isDecoderFailed -> {
-                                    _playerError.value = "Hardware unsupported: Your device cannot decode this video format (e.g., HEVC 10-bit)."
-                                }
-                                isSourceError -> {
-                                    // Skip the broken file – notify the ViewModel
-                                    val msg = error.message ?: "Source error"
-                                    onPlaybackError?.invoke(msg)
-                                }
-                                else -> {
-                                    _playerError.value = error.message ?: "Unknown playback error"
-                                }
-                            }
-                        }
-                    })
-
-                    addAnalyticsListener(object : androidx.media3.exoplayer.analytics.AnalyticsListener {
-                        override fun onAudioSessionIdChanged(
-                            eventTime: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime,
-                            audioSessionId: Int
-                        ) {
-                            if (_isAudioBoostEnabled.value) {
-                                applyLoudnessEnhancer(audioSessionId)
-                            }
-                        }
-
-                        override fun onVideoDecoderInitialized(
-                            eventTime: androidx.media3.exoplayer.analytics.AnalyticsListener.EventTime,
-                            decoderName: String,
-                            initializedTimestampMs: Long,
-                            initializationDurationMs: Long
-                        ) {
-                            _videoDecoderName.value = decoderName
-                        }
-                    })
-
-                    // Dynamically calculate FPS for SW decoders which often lack format fps
-                    setVideoFrameMetadataListener(object : androidx.media3.exoplayer.video.VideoFrameMetadataListener {
-                        private var frameCount = 0
-                        private var lastTimeMs = System.currentTimeMillis()
-
-                        override fun onVideoFrameAboutToBeRendered(
-                            presentationTimeUs: Long,
-                            releaseTimeNs: Long,
-                            format: androidx.media3.common.Format,
-                            mediaFormat: android.media.MediaFormat?
-                        ) {
-                            frameCount++
-                            val now = System.currentTimeMillis()
-                            val diff = now - lastTimeMs
-                            if (diff >= 1000) {
-                                val currentFps = (frameCount * 1000f) / diff
-                                _videoFps.value = currentFps
-                                frameCount = 0
-                                lastTimeMs = now
-                            }
-                        }
-                    })
+        val future = MediaController.Builder(
+            context.applicationContext,
+            SessionToken(
+                context.applicationContext,
+                ComponentName(context.applicationContext, PlaybackService::class.java)
+            )
+        ).buildAsync()
+        controllerFuture = future
+        future.addListener({
+            val controller = runCatching { future.get() }.getOrNull() ?: return@addListener
+            player = controller
+            controller.addListener(object : Player.Listener {
+                override fun onIsPlayingChanged(isPlaying: Boolean) {
+                    _isPlaying.value = isPlaying
                 }
 
-            val player = exoPlayer!!
-            val forwardingPlayer = object : ForwardingPlayer(player) {
-                override fun seekToNext() {
-                    onPlayNext?.invoke()
+                override fun onPlaybackStateChanged(playbackState: Int) {
+                    if (playbackState == Player.STATE_READY) {
+                        _duration.value = controller.duration.coerceAtLeast(0L)
+                    } else if (playbackState == Player.STATE_ENDED) {
+                        onVideoEnded?.invoke()
+                    }
                 }
-                override fun seekToNextMediaItem() {
-                    onPlayNext?.invoke()
-                }
-                override fun seekToPrevious() {
-                    onPlayPrevious?.invoke()
-                }
-                override fun seekToPreviousMediaItem() {
-                    onPlayPrevious?.invoke()
-                }
-                override fun getAvailableCommands(): Player.Commands {
-                    return super.getAvailableCommands().buildUpon()
-                        .add(Player.COMMAND_SEEK_TO_NEXT)
-                        .add(Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
-                        .add(Player.COMMAND_SEEK_TO_PREVIOUS)
-                        .add(Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)
-                        .build()
-                }
-            }
 
-            mediaSession = MediaSession.Builder(context, forwardingPlayer).build()
+                override fun onVideoSizeChanged(videoSize: VideoSize) {
+                    if (videoSize.width > 0 && videoSize.height > 0) {
+                        _isPortraitVideo.value = videoSize.height > videoSize.width
+                    }
+                }
 
-            exoPlayer?.trackSelectionParameters = exoPlayer!!.trackSelectionParameters
+                override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
+                    updateTrackState(tracks)
+                }
+
+                override fun onPlayerError(error: PlaybackException) {
+                    AppLogger.log("MediaController playback error: ${error.message} - $error")
+                    _playerError.value = error.message ?: "Playback error"
+                    onPlaybackError?.invoke(error.message ?: "Playback error")
+                }
+            })
+            controller.trackSelectionParameters = controller.trackSelectionParameters
                 .buildUpon()
                 .setPreferredAudioLanguage(if (defaultAudioLang.isEmpty()) null else defaultAudioLang)
                 .setPreferredTextLanguage(if (defaultSubtitleLang.isEmpty()) null else defaultSubtitleLang)
                 .build()
+            onControllerReady?.invoke()
+        }, ContextCompat.getMainExecutor(context.applicationContext))
+    }
+
+    private fun updateTrackState(tracks: androidx.media3.common.Tracks) {
+        val newAudioTracks = mutableListOf<TrackInfo>()
+        val newSubtitleTracks = mutableListOf<TrackInfo>()
+        var currentAudioIdx = -1
+        var currentSubIdx = -1
+        val audioGroupCount = tracks.groups.count { it.type == C.TRACK_TYPE_AUDIO }
+        val subtitleGroupCount = tracks.groups.count { it.type == C.TRACK_TYPE_TEXT }
+        for (group in tracks.groups) {
+            val format = group.getTrackFormat(0)
+            when (group.type) {
+                C.TRACK_TYPE_AUDIO -> {
+                    val index = newAudioTracks.size
+                    val language = format.language?.let { java.util.Locale.forLanguageTag(it).displayLanguage }
+                    val label = if (audioGroupCount == 1) language ?: "Default"
+                    else "Track ${index + 1}" + (if (language != null) " - $language" else "")
+                    newAudioTracks.add(TrackInfo(index, label, format.language))
+                    if (group.isSelected) currentAudioIdx = index
+                }
+                C.TRACK_TYPE_TEXT -> {
+                    val index = newSubtitleTracks.size
+                    val language = format.language?.let { java.util.Locale.forLanguageTag(it).displayLanguage }
+                    val label = if (subtitleGroupCount == 1) language ?: "Default"
+                    else "Track ${index + 1}" + (if (language != null) " - $language" else "")
+                    newSubtitleTracks.add(TrackInfo(index, label, format.language))
+                    if (group.isSelected) currentSubIdx = index
+                }
+            }
         }
+        _audioTracks.value = newAudioTracks
+        _selectedAudioIndex.value = currentAudioIdx
+        _subtitleTracks.value = newSubtitleTracks
+        _selectedSubtitleIndex.value = currentSubIdx
     }
 
     fun updatePreferredLanguages(audioLang: String, subLang: String) {
-        val player = exoPlayer ?: return
+        val player = player ?: return
         player.trackSelectionParameters = player.trackSelectionParameters
             .buildUpon()
             .setPreferredAudioLanguage(if (audioLang.isEmpty()) null else audioLang)
@@ -384,14 +254,12 @@ class PlayerManager(private val context: Context) {
         }
     }
 
-    @SuppressLint("Range")
     fun toggleAudioBoost(enabled: Boolean) {
         _isAudioBoostEnabled.value = enabled
-        val player = exoPlayer ?: return
+        val player = player ?: return
 
         if (enabled) {
             player.volume = 2.0f
-            applyLoudnessEnhancer(player.audioSessionId)
         } else {
             player.volume = 1.0f
             try {
@@ -403,7 +271,7 @@ class PlayerManager(private val context: Context) {
     }
 
     fun playVideo(video: Video) {
-        val player = exoPlayer ?: return
+        val player = player ?: return
         _playerError.value = null
         val mediaItem = MediaItem.fromUri(video.uri)
         player.setMediaItem(mediaItem)
@@ -416,12 +284,12 @@ class PlayerManager(private val context: Context) {
     }
 
     fun setPlaybackSpeed(speed: Float) {
-        val player = exoPlayer ?: return
+        val player = player ?: return
         player.playbackParameters = androidx.media3.common.PlaybackParameters(speed)
     }
 
     fun playPause() {
-        val player = exoPlayer ?: return
+        val player = player ?: return
         if (player.isPlaying) {
             player.pause()
         } else {
@@ -430,62 +298,56 @@ class PlayerManager(private val context: Context) {
     }
 
     fun pause() {
-        exoPlayer?.pause()
+        player?.pause()
     }
 
     fun resume() {
-        exoPlayer?.play()
+        player?.play()
     }
 
     fun seekTo(positionMs: Long) {
-        exoPlayer?.seekTo(positionMs)
+        player?.seekTo(positionMs)
     }
 
     fun seekSmooth(positionMs: Long) {
-        val player = exoPlayer ?: return
+        val player = player ?: return
         val duration = player.duration.coerceAtLeast(0L)
         player.seekTo(positionMs.coerceIn(0L, duration))
     }
 
     fun seekForward(ms: Long = 10000L) {
-        val player = exoPlayer ?: return
+        val player = player ?: return
         val currentPos = player.currentPosition
         val newPos = (currentPos + ms).coerceAtMost(player.duration.coerceAtLeast(0L))
         player.seekTo(newPos)
     }
 
     fun seekBackward(ms: Long = 10000L) {
-        val player = exoPlayer ?: return
+        val player = player ?: return
         val currentPos = player.currentPosition
         val newPos = (currentPos - ms).coerceAtLeast(0L)
         player.seekTo(newPos)
     }
 
     fun updateProgress() {
-        val player = exoPlayer ?: return
+        val player = player ?: return
         _currentPosition.value = player.currentPosition.coerceAtLeast(0L)
         _bufferedPosition.value = player.bufferedPosition.coerceAtLeast(0L)
         _duration.value = player.duration.coerceAtLeast(0L)
         
-        player.videoFormat?.frameRate?.let { fps ->
-            if (fps > 0f) {
-                _videoFps.value = fps
-            }
-        }
     }
 
     fun releasePlayerAndKeepState(): Pair<Long, Boolean> {
-        val pos = exoPlayer?.currentPosition ?: 0L
-        val playing = exoPlayer?.isPlaying ?: false
+        val pos = player?.currentPosition ?: 0L
+        val playing = player?.isPlaying ?: false
         releasePlayer()
         return Pair(pos, playing)
     }
 
     fun releasePlayer() {
-        mediaSession?.release()
-        mediaSession = null
-        exoPlayer?.release()
-        exoPlayer = null
+        controllerFuture?.let { runCatching { MediaController.releaseFuture(it) } }
+        controllerFuture = null
+        player = null
         try {
             loudnessEnhancer?.enabled = false
             loudnessEnhancer?.release()
@@ -495,13 +357,13 @@ class PlayerManager(private val context: Context) {
 
     @UnstableApi
     fun setScrubbingMode(enabled: Boolean) {
-        exoPlayer?.setScrubbingModeEnabled(enabled)
+        // Scrubbing mode is an ExoPlayer implementation detail. The service owns it now.
     }
 
     // --- Audio & Subtitle Selection ---
 
     fun selectAudioTrack(index: Int) {
-        val player = exoPlayer ?: return
+        val player = player ?: return
         var audioGroupIndex = -1
         var matchCount = 0
 
@@ -527,7 +389,7 @@ class PlayerManager(private val context: Context) {
     }
 
     fun selectSubtitleTrack(index: Int) {
-        val player = exoPlayer ?: return
+        val player = player ?: return
 
         if (index == -1) {
             player.trackSelectionParameters = player.trackSelectionParameters
@@ -563,7 +425,7 @@ class PlayerManager(private val context: Context) {
     }
 
     fun loadExternalSubtitle(uri: Uri, mimeType: String, encodingLabel: String = "UTF-8") {
-        val player = exoPlayer ?: return
+        val player = player ?: return
         val currentMediaItem = player.currentMediaItem ?: return
 
         val uriPath = uri.path ?: uri.toString()
